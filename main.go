@@ -17,13 +17,15 @@ import (
 var regexpValidIdentifier = regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 var (
-	flagFile = ""
-	flagVars = stringSliceValue{}
+	flagFile  string
+	flagNoenv bool
+	flagVars  stringSliceValue
 )
 
 func main() {
 	// set up flags
 	flag.StringVar(&flagFile, "file", "", "file to parse")
+	flag.BoolVar(&flagNoenv, "noenv", false, "do not get variables from environment")
 	flag.Var(&flagVars, "var", "set a variable var=value, can be repeated")
 	flag.Parse()
 	// run
@@ -34,9 +36,29 @@ func main() {
 }
 
 func run() error {
-	var root Root
-	var ctx hcl.EvalContext
-	ctx.Variables = make(map[string]cty.Value, len(flagVars))
+	// parse variables from env & args and add to EvalContext
+	varCount := len(flagVars)
+	environ := os.Environ()
+	if !flagNoenv {
+		varCount += len(environ)
+	}
+	ctx := hcl.EvalContext{
+		Variables: make(map[string]cty.Value, varCount),
+	}
+	if !flagNoenv {
+		for _, envDef := range environ {
+			parts := strings.SplitN(envDef, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			name := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			if !regexpValidIdentifier.MatchString(name) {
+				continue
+			}
+			ctx.Variables[name] = cty.StringVal(value)
+		}
+	}
 	if len(flagVars) != 0 {
 		for _, varDef := range flagVars {
 			parts := strings.SplitN(varDef, "=", 2)
@@ -55,9 +77,12 @@ func run() error {
 			}
 		}
 	}
+	// parse declaration file
+	var root Root
 	if err := hclsimple.DecodeFile(flagFile, &ctx, &root); err != nil {
 		return fmt.Errorf("decoding file \"%s\": %w", flagFile, err)
 	}
+	// create deployment dependency graph
 	deployments := root.Deployments
 	g := graph.New(len(deployments))
 	for i := range root.Deployments {
@@ -93,6 +118,7 @@ func run() error {
 			}
 		}
 	}
+	// check for dependency cycles
 	components := graph.StrongComponents(g)
 	for _, component := range components {
 		if len(component) == 1 {
@@ -105,6 +131,7 @@ func run() error {
 		}
 		return fmt.Errorf("dependency cycle detected: %s", strings.Join(deploymentNames, ", "))
 	}
+	// sort and print graph
 	topSort, ok := graph.TopSort(g)
 	if !ok {
 		fmt.Fprintln(os.Stderr, "ERROR: topological sort failed")
