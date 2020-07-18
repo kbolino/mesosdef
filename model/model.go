@@ -1,4 +1,4 @@
-package main
+package model
 
 type Root struct {
 	Mesos       *Mesos       `hcl:"mesos,block"`

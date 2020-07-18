@@ -8,6 +8,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/kbolino/mesosdef/model"
+
 	hcl "github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsimple"
 	"github.com/yourbasic/graph"
@@ -17,14 +19,16 @@ import (
 var regexpValidIdentifier = regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 var (
-	flagFile  string
-	flagNoenv bool
-	flagVars  stringSliceValue
+	flagFile      string
+	flagMaxDeploy int
+	flagNoenv     bool
+	flagVars      stringSliceValue
 )
 
 func main() {
 	// set up flags
 	flag.StringVar(&flagFile, "file", "", "file to parse")
+	flag.IntVar(&flagMaxDeploy, "maxDeploy", 5, "maximum number of simultaneous deployments")
 	flag.BoolVar(&flagNoenv, "noenv", false, "do not get variables from environment")
 	flag.Var(&flagVars, "var", "set a variable var=value, can be repeated")
 	flag.Parse()
@@ -78,7 +82,7 @@ func run() error {
 		}
 	}
 	// parse declaration file
-	var root Root
+	var root model.Root
 	if err := hclsimple.DecodeFile(flagFile, &ctx, &root); err != nil {
 		return fmt.Errorf("decoding file \"%s\": %w", flagFile, err)
 	}
@@ -153,14 +157,14 @@ func run() error {
 	return nil
 }
 
-func findDependents(dependency *DependencyRef, deployments []Deployment) ([]int, error) {
+func findDependents(dependency *model.DependencyRef, deployments []model.Deployment) ([]int, error) {
 	filters := dependency.Filters
 	if dependency.Name != "" {
 		if len(filters) != 0 {
 			return nil, fmt.Errorf("dependency can have name attribute or filter blocks but not both")
 		}
-		filters = []Filter{
-			Filter{
+		filters = []model.Filter{
+			model.Filter{
 				Key:   "name",
 				Value: dependency.Name,
 			},
@@ -199,7 +203,7 @@ func findDependents(dependency *DependencyRef, deployments []Deployment) ([]int,
 	return dependents, nil
 }
 
-func filterMatches(filter *Filter, deployment *Deployment) (bool, error) {
+func filterMatches(filter *model.Filter, deployment *model.Deployment) (bool, error) {
 	values := filter.Values
 	if len(values) == 0 {
 		if filter.Value == "" {
