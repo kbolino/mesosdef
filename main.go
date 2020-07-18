@@ -4,7 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	hcl "github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsimple"
@@ -12,25 +14,49 @@ import (
 	"github.com/zclconf/go-cty/cty"
 )
 
+var regexpValidIdentifier = regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_]*$")
+
 var (
-	flagFile = flag.String("file", "", "file to parse")
+	flagFile = ""
+	flagVars = stringSliceValue{}
 )
 
 func main() {
+	// set up flags
+	flag.StringVar(&flagFile, "file", "", "file to parse")
+	flag.Var(&flagVars, "var", "set a variable var=value, can be repeated")
 	flag.Parse()
-	os.Exit(run())
+	// run
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %s", err)
+		os.Exit(1)
+	}
 }
 
-func run() int {
+func run() error {
 	var root Root
 	var ctx hcl.EvalContext
-	ctx.Variables = map[string]cty.Value{
-		"deploy_root": cty.StringVal("./deploy"),
-		"dns_tld":     cty.StringVal("mesos"),
+	ctx.Variables = make(map[string]cty.Value, len(flagVars))
+	if len(flagVars) != 0 {
+		for _, varDef := range flagVars {
+			parts := strings.SplitN(varDef, "=", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid variable declaration \"%s\"", varDef)
+			}
+			name := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			if !regexpValidIdentifier.MatchString(name) {
+				return fmt.Errorf("invalid variable name \"%s\"", name)
+			}
+			if len(value) == 0 {
+				delete(ctx.Variables, name)
+			} else {
+				ctx.Variables[name] = cty.StringVal(value)
+			}
+		}
 	}
-	if err := hclsimple.DecodeFile(*flagFile, &ctx, &root); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+	if err := hclsimple.DecodeFile(flagFile, &ctx, &root); err != nil {
+		return fmt.Errorf("decoding file \"%s\": %w", flagFile, err)
 	}
 	deployments := root.Deployments
 	g := graph.New(len(deployments))
@@ -40,9 +66,8 @@ func run() int {
 			dependency := &deployment.Dependencies[j]
 			dependents, err := findDependents(dependency, deployments)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: finding dependents of deployment.%s.%s: %s",
+				return fmt.Errorf("finding dependents of deployment.%s.%s: %w",
 					deployment.Type, deployment.Name, err)
-				return 1
 			}
 			var c int64
 			if dependency.WaitForHealthy {
@@ -56,9 +81,8 @@ func run() int {
 			inverseDependency := &deployment.DependencyOf[j]
 			inverseDependents, err := findDependents(inverseDependency, deployments)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: finding inverse dependents for deploymen.%s.%s: %s",
+				return fmt.Errorf("finding inverse dependents of deployment %s.%s: %w",
 					deployment.Type, deployment.Name, err)
-				return 1
 			}
 			var c int64
 			if inverseDependency.WaitForHealthy {
@@ -79,8 +103,7 @@ func run() int {
 			deployment := &deployments[i]
 			deploymentNames = append(deploymentNames, fmt.Sprintf("%s.%s", deployment.Type, deployment.Name))
 		}
-		fmt.Fprintf(os.Stderr, "ERROR: dependency cycle detected: %s\n", strings.Join(deploymentNames, ", "))
-		return 1
+		return fmt.Errorf("dependency cycle detected: %s", strings.Join(deploymentNames, ", "))
 	}
 	topSort, ok := graph.TopSort(g)
 	if !ok {
@@ -100,7 +123,7 @@ func run() int {
 			return false
 		})
 	}
-	return 0
+	return nil
 }
 
 func findDependents(dependency *DependencyRef, deployments []Deployment) ([]int, error) {
@@ -166,20 +189,98 @@ func filterMatches(filter *Filter, deployment *Deployment) (bool, error) {
 	default:
 		return false, fmt.Errorf("unknown filter key \"%s\", only \"name\" and \"labels\" supported", filter.Key)
 	}
-	if !filter.Negate && len(compareTo) == 0 {
-		return false, nil
-	}
-	if filter.Glob {
-		return false, fmt.Errorf("glob not supported yet")
-	} else if filter.Regexp {
-		return false, fmt.Errorf("regexp not supported yet")
+	if len(compareTo) == 0 {
+		return filter.Negate, nil
 	}
 	for _, val := range values {
-		for _, cmp := range compareTo {
-			if val == cmp {
-				return !filter.Negate, nil
+		if filter.Glob || filter.Regexp {
+			valRegexp := val
+			if filter.Glob {
+				var err error
+				valRegexp, err = globToRegexp(val)
+				if err != nil {
+					return false, fmt.Errorf("invalid glob pattern \"%s\": %w", val, err)
+				}
+			}
+			compiled, err := regexp.Compile(valRegexp)
+			if err != nil {
+				return false, fmt.Errorf("invalid regexp pattern \"%s\": %w", valRegexp, err)
+			}
+			for _, cmp := range compareTo {
+				if compiled.MatchString(cmp) {
+					return !filter.Negate, nil
+				}
+			}
+		} else {
+			for _, cmp := range compareTo {
+				if val == cmp {
+					return !filter.Negate, nil
+				}
 			}
 		}
 	}
 	return filter.Negate, nil
+}
+
+func globToRegexp(glob string) (string, error) {
+	var result strings.Builder
+	result.WriteRune('^')
+	backslash := false
+	for i, r := range glob {
+		switch r {
+		case '\\':
+			if backslash {
+				result.WriteString("\\\\")
+				backslash = false
+			} else {
+				backslash = true
+			}
+		case '*':
+			if backslash {
+				result.WriteString("\\*")
+				backslash = false
+			} else {
+				result.WriteString(".*")
+			}
+		case '?':
+			if backslash {
+				result.WriteString("\\?")
+			} else {
+				result.WriteString(".")
+			}
+		case '[':
+			if backslash {
+				result.WriteString("\\[")
+			} else {
+				return "", fmt.Errorf("character classes not supported in glob yet")
+			}
+		case ']':
+			if backslash {
+				result.WriteString("\\]")
+			} else {
+				return "", fmt.Errorf("character classes not supported in glob yet")
+			}
+		default:
+			if backslash {
+				return "", fmt.Errorf("unknown escape sequence \"\\%c\"", r)
+			} else {
+				result.WriteString(regexp.QuoteMeta(glob[i : i+utf8.RuneLen(r)]))
+			}
+		}
+	}
+	result.WriteRune('$')
+	return result.String(), nil
+}
+
+type stringSliceValue []string
+
+var _ flag.Value = &stringSliceValue{}
+
+func (v *stringSliceValue) String() string {
+	return strings.Join(*v, ", ")
+}
+
+func (v *stringSliceValue) Set(value string) error {
+	*v = append(*v, value)
+	return nil
 }
