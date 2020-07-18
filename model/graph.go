@@ -9,12 +9,20 @@ import (
 	"github.com/yourbasic/graph"
 )
 
+// Graph is a graph of deployments connected by their dependencies.
+// Ideally, this should be a directed acyclic graph (DAG) and some methods
+// will return errors if the graph is not a DAG.
+// A graph g is a DAG if len(g.Cycles()) == 0.
 type Graph struct {
 	deployments []DeploymentRef
 	index       map[DeploymentRef]int
 	rawGraph    *graph.Mutable
 }
 
+// Build builds a graph from the given deployments.
+// Returns a non-nil error if the graph has already been built, if any of the
+// explicit dependencies can't be resolved, or if any of the dependency
+// filters are invalid.
 func (g *Graph) Build(deployments ...Deployment) error {
 	if len(g.deployments) != 0 {
 		return fmt.Errorf("graph has already been built")
@@ -50,7 +58,7 @@ func (g *Graph) Build(deployments ...Deployment) error {
 			inverseDependency := &deployment.DependencyOf[j]
 			inverseDependents, err := findDependents(inverseDependency, deployments)
 			if err != nil {
-				return fmt.Errorf("finding inverse depende0nts of deployment %s.%s: %w",
+				return fmt.Errorf("finding inverse dependents of deployment %s.%s: %w",
 					deployment.Type, deployment.Name, err)
 			}
 			var c int64
@@ -65,6 +73,7 @@ func (g *Graph) Build(deployments ...Deployment) error {
 	return nil
 }
 
+// Cycles returns a list of all dependency cycles in the graph.
 func (g *Graph) Cycles() [][]DeploymentRef {
 	components := graph.StrongComponents(g.rawGraph)
 	var cycles [][]DeploymentRef
@@ -80,6 +89,10 @@ func (g *Graph) Cycles() [][]DeploymentRef {
 	return cycles
 }
 
+// DeployOrder returns a list of all deployments in the graph, sorted in the
+// order they would be deployed.
+// This is equivalent to a reverse topological sort of the dependency graph.
+// Returns a non-nil error if and only if there are cycles in the graph.
 func (g *Graph) DeployOrder() ([]DeploymentRef, error) {
 	topSort, ok := graph.TopSort(g.rawGraph)
 	if !ok {
@@ -93,6 +106,8 @@ func (g *Graph) DeployOrder() ([]DeploymentRef, error) {
 	return deployments, nil
 }
 
+// Dependencies returns a list of all resolved dependencies for a deployment.
+// Returns a non-nil error if and only if the deployment is not in the graph.
 func (g *Graph) Dependencies(deployment DeploymentRef) ([]DependencyRef, error) {
 	v, ok := g.index[deployment]
 	if !ok {
@@ -112,11 +127,15 @@ func (g *Graph) Dependencies(deployment DeploymentRef) ([]DependencyRef, error) 
 	return dependencies, nil
 }
 
+// findDependents returns a slice of all the deployment indices that match
+// the given dependency spec.
 func findDependents(dependency *DependencySpec, deployments []Deployment) ([]int, error) {
 	filters := dependency.Filters
 	if dependency.Name != "" {
 		if len(filters) != 0 {
 			return nil, fmt.Errorf("dependency can have name attribute or filter blocks but not both")
+		} else if dependency.Type == "*" {
+			return nil, fmt.Errorf("dependency type cannot be \"*\" if name attribute is specified")
 		}
 		filters = []Filter{
 			Filter{
@@ -136,8 +155,8 @@ func findDependents(dependency *DependencySpec, deployments []Deployment) ([]int
 				continue
 			}
 		default:
-			return nil, fmt.Errorf("unknown dependency type \"%s\", only \"*\", \"marathon_app\", and \"chronos_job\" supported",
-				dependency.Type)
+			return nil, fmt.Errorf("unknown dependency type \"%s\", only \"*\", \"marathon_app\", "+
+				"and \"chronos_job\" are supported", dependency.Type)
 		}
 		allMatch := true
 		for i := range filters {
@@ -155,9 +174,14 @@ func findDependents(dependency *DependencySpec, deployments []Deployment) ([]int
 			dependents = append(dependents, i)
 		}
 	}
+	if dependency.Name != "" && len(dependents) != 1 {
+		return nil, fmt.Errorf("dependent deployment %s.%s not found", dependency.Type, dependency.Name)
+	}
 	return dependents, nil
 }
 
+// filterMatches returns true if and only if the given filter matches the
+// given deployment.
 func filterMatches(filter *Filter, deployment *Deployment) (bool, error) {
 	values := filter.Values
 	if len(values) == 0 {
@@ -208,6 +232,7 @@ func filterMatches(filter *Filter, deployment *Deployment) (bool, error) {
 	return filter.Negate, nil
 }
 
+// globToRegexp converts a glob expression into a regular expression.
 func globToRegexp(glob string) (string, error) {
 	var result strings.Builder
 	result.WriteRune('^')

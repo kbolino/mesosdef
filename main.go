@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/kbolino/mesosdef/model"
@@ -13,8 +12,6 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsimple"
 	"github.com/zclconf/go-cty/cty"
 )
-
-var regexpValidIdentifier = regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 var (
 	flagFile      string
@@ -55,7 +52,7 @@ func run() error {
 			}
 			name := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
-			if !regexpValidIdentifier.MatchString(name) {
+			if !model.IsValidIdentifier(name) {
 				continue
 			}
 			ctx.Variables[name] = cty.StringVal(value)
@@ -69,7 +66,7 @@ func run() error {
 			}
 			name := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
-			if !regexpValidIdentifier.MatchString(name) {
+			if !model.IsValidIdentifier(name) {
 				return fmt.Errorf("invalid variable name \"%s\"", name)
 			}
 			if len(value) == 0 {
@@ -83,6 +80,57 @@ func run() error {
 	var root model.Root
 	if err := hclsimple.DecodeFile(flagFile, &ctx, &root); err != nil {
 		return fmt.Errorf("decoding file \"%s\": %w", flagFile, err)
+	}
+	// validate and index frameworks
+	frameworksByRef := make(map[model.FrameworkRef]*model.Framework)
+	for i := range root.Frameworks {
+		framework := &root.Frameworks[i]
+		switch framework.Type {
+		case "marathon", "chronos":
+			// ok
+		default:
+			return fmt.Errorf("invalid framework type \"%s\"", framework.Type)
+		}
+		if !model.IsValidIdentifier(framework.Name) {
+			return fmt.Errorf("invalid framework name \"%s\"", framework.Name)
+		}
+		if _, exists := frameworksByRef[framework.Ref()]; exists {
+			return fmt.Errorf("duplicate framework %s.%s", framework.Type, framework.Name)
+		}
+		frameworksByRef[framework.Ref()] = framework
+	}
+	// validate and index deployments
+	deploymentsByRef := make(map[model.DeploymentRef]*model.Deployment)
+	for i := range root.Deployments {
+		deployment := &root.Deployments[i]
+		frameworkType := ""
+		switch deployment.Type {
+		case "marathon_app":
+			frameworkType = "marathon"
+		case "chronos_job":
+			frameworkType = "chronos"
+		default:
+			return fmt.Errorf("invalid deployment type \"%s\"", deployment.Type)
+		}
+		if !model.IsValidIdentifier(deployment.Name) {
+			return fmt.Errorf("invalid deployment name \"%s\"", deployment.Name)
+		}
+		if _, exists := deploymentsByRef[deployment.Ref()]; exists {
+			return fmt.Errorf("duplicate deployment %s.%s", deployment.Type, deployment.Name)
+		}
+		frameworkName := deployment.Framework
+		if frameworkName == "" {
+			frameworkName = "default"
+		}
+		frameworkRef := model.FrameworkRef{
+			Type: frameworkType,
+			Name: frameworkName,
+		}
+		if _, exists := frameworksByRef[frameworkRef]; !exists {
+			return fmt.Errorf("no framework %s.%s defined for deployment %s.%s", frameworkType, frameworkName,
+				deployment.Type, deployment.Name)
+		}
+		deploymentsByRef[deployment.Ref()] = deployment
 	}
 	// create deployment dependency graph
 	var graph model.Graph
