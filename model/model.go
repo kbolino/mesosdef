@@ -25,16 +25,29 @@ type DeploymentRef struct {
 }
 
 type Deployment struct {
-	Type         string          `hcl:"type,label"`
-	Name         string          `hcl:"name,label"`
-	Framework    string          `hcl:"framework,optional"`
-	Deploy       string          `hcl:"deploy,attr"`
-	Labels       []string        `hcl:"labels,optional"`
-	Dependencies []DependencyRef `hcl:"dependency,block"`
-	DependencyOf []DependencyRef `hcl:"dependency_of,block"`
+	Type         string           `hcl:"type,label"`
+	Name         string           `hcl:"name,label"`
+	Framework    string           `hcl:"framework,optional"`
+	Deploy       string           `hcl:"deploy,attr"`
+	Labels       []string         `hcl:"labels,optional"`
+	Dependencies []DependencySpec `hcl:"dependency,block"`
+	DependencyOf []DependencySpec `hcl:"dependency_of,block"`
+}
+
+func (d *Deployment) Ref() DeploymentRef {
+	return DeploymentRef{
+		Type: d.Type,
+		Name: d.Name,
+	}
 }
 
 type DependencyRef struct {
+	Type           string `hcl:"type,attr"`
+	Name           string `hcl:"name,attr"`
+	WaitForHealthy bool   `hcl:"wait_for_healthy,optional"`
+}
+
+type DependencySpec struct {
 	Type           string   `hcl:"type,attr"`
 	Name           string   `hcl:"name,optional"`
 	WaitForHealthy bool     `hcl:"wait_for_healthy,optional"`

@@ -6,13 +6,11 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/kbolino/mesosdef/model"
 
 	hcl "github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsimple"
-	"github.com/yourbasic/graph"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -87,220 +85,37 @@ func run() error {
 		return fmt.Errorf("decoding file \"%s\": %w", flagFile, err)
 	}
 	// create deployment dependency graph
-	deployments := root.Deployments
-	g := graph.New(len(deployments))
-	for i := range root.Deployments {
-		deployment := &root.Deployments[i]
-		for j := range deployment.Dependencies {
-			dependency := &deployment.Dependencies[j]
-			dependents, err := findDependents(dependency, deployments)
-			if err != nil {
-				return fmt.Errorf("finding dependents of deployment.%s.%s: %w",
-					deployment.Type, deployment.Name, err)
-			}
-			var c int64
-			if dependency.WaitForHealthy {
-				c = 1
-			}
-			for _, k := range dependents {
-				g.AddCost(i, k, c)
-			}
-		}
-		for j := range deployment.DependencyOf {
-			inverseDependency := &deployment.DependencyOf[j]
-			inverseDependents, err := findDependents(inverseDependency, deployments)
-			if err != nil {
-				return fmt.Errorf("finding inverse dependents of deployment %s.%s: %w",
-					deployment.Type, deployment.Name, err)
-			}
-			var c int64
-			if inverseDependency.WaitForHealthy {
-				c = 1
-			}
-			for _, k := range inverseDependents {
-				g.AddCost(k, i, c)
-			}
-		}
-	}
+	var graph model.Graph
+	graph.Build(root.Deployments...)
 	// check for dependency cycles
-	components := graph.StrongComponents(g)
-	for _, component := range components {
-		if len(component) == 1 {
-			continue
-		}
+	cycles := graph.Cycles()
+	if len(cycles) != 0 {
 		var deploymentNames []string
-		for _, i := range component {
-			deployment := &deployments[i]
+		for _, deployment := range cycles[0] {
 			deploymentNames = append(deploymentNames, fmt.Sprintf("%s.%s", deployment.Type, deployment.Name))
 		}
 		return fmt.Errorf("dependency cycle detected: %s", strings.Join(deploymentNames, ", "))
 	}
 	// sort and print graph
-	topSort, ok := graph.TopSort(g)
-	if !ok {
-		fmt.Fprintln(os.Stderr, "ERROR: topological sort failed")
+	deployOrder, err := graph.DeployOrder()
+	if err != nil {
+		return err
 	}
-	for i := len(topSort) - 1; i >= 0; i-- {
-		j := topSort[i]
-		deployment := &deployments[j]
+	for _, deployment := range deployOrder {
 		fmt.Printf("%s.%s\n", deployment.Type, deployment.Name)
-		g.Visit(j, func(w int, c int64) bool {
-			dependentDeployment := &deployments[w]
+		dependencies, err := graph.Dependencies(deployment)
+		if err != nil {
+			return err
+		}
+		for _, dependency := range dependencies {
 			prefix := "immediately after"
-			if c != 0 {
+			if dependency.WaitForHealthy {
 				prefix = "after waiting for"
 			}
-			fmt.Printf("\t%s %s.%s\n", prefix, dependentDeployment.Type, dependentDeployment.Name)
-			return false
-		})
+			fmt.Printf("\t%s %s.%s\n", prefix, dependency.Type, dependency.Name)
+		}
 	}
 	return nil
-}
-
-func findDependents(dependency *model.DependencyRef, deployments []model.Deployment) ([]int, error) {
-	filters := dependency.Filters
-	if dependency.Name != "" {
-		if len(filters) != 0 {
-			return nil, fmt.Errorf("dependency can have name attribute or filter blocks but not both")
-		}
-		filters = []model.Filter{
-			model.Filter{
-				Key:   "name",
-				Value: dependency.Name,
-			},
-		}
-	}
-	var dependents []int
-	for i := range deployments {
-		deployment := &deployments[i]
-		switch dependency.Type {
-		case "*":
-			// do nothing
-		case "marathon_app", "chronos_job":
-			if dependency.Type != deployment.Type {
-				continue
-			}
-		default:
-			return nil, fmt.Errorf("unknown dependency type \"%s\", only \"*\", \"marathon_app\", and \"chronos_job\" supported",
-				dependency.Type)
-		}
-		allMatch := true
-		for i := range filters {
-			filter := &filters[i]
-			matches, err := filterMatches(filter, deployment)
-			if err != nil {
-				return nil, err
-			}
-			if !matches {
-				allMatch = false
-				break
-			}
-		}
-		if allMatch {
-			dependents = append(dependents, i)
-		}
-	}
-	return dependents, nil
-}
-
-func filterMatches(filter *model.Filter, deployment *model.Deployment) (bool, error) {
-	values := filter.Values
-	if len(values) == 0 {
-		if filter.Value == "" {
-			return false, fmt.Errorf("filter must have one of value or values attribute")
-		}
-		values = []string{filter.Value}
-	}
-	var compareTo []string
-	switch filter.Key {
-	case "name":
-		compareTo = []string{deployment.Name}
-	case "labels":
-		compareTo = deployment.Labels
-	default:
-		return false, fmt.Errorf("unknown filter key \"%s\", only \"name\" and \"labels\" supported", filter.Key)
-	}
-	if len(compareTo) == 0 {
-		return filter.Negate, nil
-	}
-	for _, val := range values {
-		if filter.Glob || filter.Regexp {
-			valRegexp := val
-			if filter.Glob {
-				var err error
-				valRegexp, err = globToRegexp(val)
-				if err != nil {
-					return false, fmt.Errorf("invalid glob pattern \"%s\": %w", val, err)
-				}
-			}
-			compiled, err := regexp.Compile(valRegexp)
-			if err != nil {
-				return false, fmt.Errorf("invalid regexp pattern \"%s\": %w", valRegexp, err)
-			}
-			for _, cmp := range compareTo {
-				if compiled.MatchString(cmp) {
-					return !filter.Negate, nil
-				}
-			}
-		} else {
-			for _, cmp := range compareTo {
-				if val == cmp {
-					return !filter.Negate, nil
-				}
-			}
-		}
-	}
-	return filter.Negate, nil
-}
-
-func globToRegexp(glob string) (string, error) {
-	var result strings.Builder
-	result.WriteRune('^')
-	backslash := false
-	for i, r := range glob {
-		switch r {
-		case '\\':
-			if backslash {
-				result.WriteString("\\\\")
-				backslash = false
-			} else {
-				backslash = true
-			}
-		case '*':
-			if backslash {
-				result.WriteString("\\*")
-				backslash = false
-			} else {
-				result.WriteString(".*")
-			}
-		case '?':
-			if backslash {
-				result.WriteString("\\?")
-			} else {
-				result.WriteString(".")
-			}
-		case '[':
-			if backslash {
-				result.WriteString("\\[")
-			} else {
-				return "", fmt.Errorf("character classes not supported in glob yet")
-			}
-		case ']':
-			if backslash {
-				result.WriteString("\\]")
-			} else {
-				return "", fmt.Errorf("character classes not supported in glob yet")
-			}
-		default:
-			if backslash {
-				return "", fmt.Errorf("unknown escape sequence \"\\%c\"", r)
-			} else {
-				result.WriteString(regexp.QuoteMeta(glob[i : i+utf8.RuneLen(r)]))
-			}
-		}
-	}
-	result.WriteRune('$')
-	return result.String(), nil
 }
 
 type stringSliceValue []string
