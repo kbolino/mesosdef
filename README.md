@@ -13,6 +13,13 @@ infrastructure-as-code and applying it to the Mesos ecosystem.
 
 ## Command line
 
+### Currently
+
+`mesosdef -file example.hcl` will compute the dependency graph for the defined
+deployments and print them in the order they would be deployed
+
+### Future
+
 `mesosdef validate` will statically validate files for syntatical correctness
 
 `mesosdef plan` will compute a deployment plan without making changes
