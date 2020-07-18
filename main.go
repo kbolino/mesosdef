@@ -14,22 +14,26 @@ import (
 )
 
 var (
-	flagFile      string
-	flagMaxDeploy int
-	flagNoenv     bool
-	flagVars      stringSliceValue
+	flagDeployTimeout int
+	flagFile          string
+	flagMaxDeploy     int
+	flagNoenv         bool
+	flagVars          stringSliceValue
+	flagWaitTimeout   int
 )
 
 func main() {
 	// set up flags
+	flag.IntVar(&flagDeployTimeout, "deployTimeout", 30, "timeout for deployment requests, in seconds")
 	flag.StringVar(&flagFile, "file", "", "file to parse")
 	flag.IntVar(&flagMaxDeploy, "maxDeploy", 5, "maximum number of simultaneous deployments")
 	flag.BoolVar(&flagNoenv, "noenv", false, "do not get variables from environment")
 	flag.Var(&flagVars, "var", "set a variable var=value, can be repeated")
+	flag.IntVar(&flagWaitTimeout, "waitTimeout", 300, "timeout for waiting until healthy, in seconds")
 	flag.Parse()
 	// run
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %s", err)
+		fmt.Fprintf(os.Stderr, "FATAL: %s", err)
 		os.Exit(1)
 	}
 }
