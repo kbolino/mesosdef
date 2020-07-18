@@ -138,11 +138,16 @@ func run() error {
 	// check for dependency cycles
 	cycles := graph.Cycles()
 	if len(cycles) != 0 {
-		var deploymentNames []string
-		for _, deployment := range cycles[0] {
-			deploymentNames = append(deploymentNames, fmt.Sprintf("%s.%s", deployment.Type, deployment.Name))
+		var message strings.Builder
+		message.WriteString("dependency cycle(s) detected:\n")
+		for _, cycle := range cycles {
+			var deploymentNames []string
+			for _, deployment := range cycle {
+				deploymentNames = append(deploymentNames, fmt.Sprintf("%s.%s", deployment.Type, deployment.Name))
+			}
+			fmt.Fprintf(&message, "\t=> %s <=\n", strings.Join(deploymentNames, " <==> "))
 		}
-		return fmt.Errorf("dependency cycle detected: %s", strings.Join(deploymentNames, ", "))
+		return fmt.Errorf("%s", message.String())
 	}
 	// sort and print graph
 	deployOrder, err := graph.DeployOrder()
