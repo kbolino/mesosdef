@@ -85,45 +85,6 @@ type Stats struct {
 	ElapsedTime           time.Duration
 }
 
-type Option func(c *deployerConfig) error
-
-func MaxDeploy(maxDeploy int) Option {
-	return func(c *deployerConfig) error {
-		if maxDeploy < 1 {
-			return fmt.Errorf("maxDeploy is not positive")
-		}
-		c.maxDeploy = maxDeploy
-		return nil
-	}
-}
-
-func WorkChanSize(workChanSize int) Option {
-	return func(c *deployerConfig) error {
-		if workChanSize < 0 {
-			return fmt.Errorf("workChanSize is negative")
-		}
-		c.workChanSize = workChanSize
-		return nil
-	}
-}
-
-func EventsChanSize(eventsChanSize int) Option {
-	return func(c *deployerConfig) error {
-		if eventsChanSize < 0 {
-			return fmt.Errorf("eventsChanSize is negative")
-		}
-		c.eventsChanSize = eventsChanSize
-		return nil
-	}
-}
-
-type deployerConfig struct {
-	maxDeploy      int
-	workChanSize   int
-	eventsChanSize int
-	errorsChanSize int
-}
-
 // GraphDeployer uses a Deployer to execute the ordered, dependency-conscious
 // deployment of all resources described by a graph.
 // A single GraphDeployer is meant to execute a single deployment.
@@ -136,44 +97,26 @@ type GraphDeployer struct {
 	waitGroup         sync.WaitGroup
 	deployments       []Deployment
 	deploymentsByRef  map[model.DeploymentRef]*Deployment
-	eventsChan        chan Event
+	eventsChan        chan<- Event
 	errorsChan        chan error
 	stats             Stats
 }
 
 // NewGraphDeployer creates a new GraphDeployer for the given graph,
 // deployer, and options.
-func NewGraphDeployer(graph *model.Graph, deployer Deployer, options ...Option) (*GraphDeployer, error) {
+func NewGraphDeployer(graph *model.Graph, deployer Deployer, maxDeploy int) (*GraphDeployer, error) {
 	if graph == nil {
 		return nil, fmt.Errorf("graph is nil")
 	} else if deployer == nil {
 		return nil, fmt.Errorf("deployer is nil")
 	}
-	c := &deployerConfig{
-		maxDeploy:      2,
-		workChanSize:   0,
-		eventsChanSize: 100,
-		errorsChanSize: 1,
-	}
-	for _, option := range options {
-		err := option(c)
-		if err != nil {
-			return nil, err
-		}
-	}
 	return &GraphDeployer{
 		graph:      graph,
 		deployer:   deployer,
-		maxDeploy:  c.maxDeploy,
-		workChan:   make(chan *Deployment, c.workChanSize),
-		eventsChan: make(chan Event, c.eventsChanSize),
-		errorsChan: make(chan error, c.errorsChanSize),
+		maxDeploy:  maxDeploy,
+		workChan:   make(chan *Deployment, 0),
+		errorsChan: make(chan error, 1),
 	}, nil
-}
-
-// Events returns the channel of events that will be produced by Deploy.
-func (d *GraphDeployer) Events() <-chan Event {
-	return d.eventsChan
 }
 
 // Stats returns statistics on the deployment, which are only meaningful
@@ -183,11 +126,12 @@ func (d *GraphDeployer) Stats() Stats {
 }
 
 // Deploy executes the deployment process, blocking until it is complete.
-// To monitor the status of the deployment, use the Events channel.
+// To monitor the status of the deployment, provide a non-nil events channel.
 // Deploy will create a fixed number of worker goroutines to execute the
 // and will wait until they all complete.
-func (d *GraphDeployer) Deploy() error {
-	defer close(d.eventsChan)
+func (d *GraphDeployer) Deploy(events chan<- Event) error {
+	d.eventsChan = events
+	defer d.closeEventsChan()
 	defer d.closeWorkChan()
 	startTime := time.Now()
 	defer func() {
@@ -233,6 +177,12 @@ func (d *GraphDeployer) Deploy() error {
 	}
 }
 
+func (d *GraphDeployer) closeEventsChan() {
+	if d.eventsChan != nil {
+		close(d.eventsChan)
+	}
+}
+
 // closeWorkChan closes the worker channel safely.
 func (d *GraphDeployer) closeWorkChan() {
 	d.closeWorkChanOnce.Do(func() {
@@ -248,13 +198,12 @@ func (d *GraphDeployer) sendError(err error) {
 	}
 }
 
-// sendEvent sends an event to the events channel without blocking.
+// sendEvent sends an event to the events channel if it is non-nil.
 // workerID is a mandatory parameter to ensure it gets set.
 func (d *GraphDeployer) sendEvent(workerID int, event Event) {
-	event.WorkerID = workerID
-	select {
-	case d.eventsChan <- event:
-	default:
+	if d.eventsChan != nil {
+		event.WorkerID = workerID
+		d.eventsChan <- event
 	}
 }
 

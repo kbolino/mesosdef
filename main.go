@@ -190,12 +190,12 @@ func run() error {
 		maxHealthyTime:     700 * time.Millisecond,
 		healthyErrorChance: 0.01,
 	}
-	graphDeployer, err := deploy.NewGraphDeployer(&graph, deployer)
+	events := make(chan deploy.Event, 100)
+	graphDeployer, err := deploy.NewGraphDeployer(&graph, deployer, flagMaxDeploy)
 	if err != nil {
 		return fmt.Errorf("creating graph deployer: %w", err)
 	}
 	var wg sync.WaitGroup
-	events := graphDeployer.Events()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -213,7 +213,7 @@ func run() error {
 				event.WorkerID, len(events), event.Type, deployRef.Type, deployRef.Name, otherPart)
 		}
 	}()
-	deployErr := graphDeployer.Deploy()
+	deployErr := graphDeployer.Deploy(events)
 	wg.Wait()
 	stats := graphDeployer.Stats()
 	fmt.Printf("Result: %d successful and %d failed deployments of %d resources in %s\n", stats.SuccessfulDeployments,
