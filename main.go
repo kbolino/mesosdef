@@ -3,9 +3,13 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/kbolino/mesosdef/deploy"
 	"github.com/kbolino/mesosdef/model"
 
 	hcl "github.com/hashicorp/hcl/v2"
@@ -15,6 +19,7 @@ import (
 
 var (
 	flagDeployTimeout int
+	flagDryRun        bool
 	flagFile          string
 	flagMaxDeploy     int
 	flagNoenv         bool
@@ -25,6 +30,7 @@ var (
 func main() {
 	// set up flags
 	flag.IntVar(&flagDeployTimeout, "deployTimeout", 30, "timeout for deployment requests, in seconds")
+	flag.BoolVar(&flagDryRun, "dryRun", false, "check files and produce graph, but do not deploy")
 	flag.StringVar(&flagFile, "file", "", "file to parse")
 	flag.IntVar(&flagMaxDeploy, "maxDeploy", 5, "maximum number of simultaneous deployments")
 	flag.BoolVar(&flagNoenv, "noenv", false, "do not get variables from environment")
@@ -153,25 +159,67 @@ func run() error {
 		}
 		return fmt.Errorf("%s", message.String())
 	}
-	// sort and print graph
-	deployOrder, err := graph.DeployOrder()
-	if err != nil {
-		return err
-	}
-	for _, deployment := range deployOrder {
-		fmt.Printf("%s.%s\n", deployment.Type, deployment.Name)
-		dependencies, err := graph.Dependencies(deployment)
+	// sort and print graph for dry run
+	if flagDryRun {
+		deployOrder, err := graph.DeployOrder()
 		if err != nil {
 			return err
 		}
-		for _, dependency := range dependencies {
-			prefix := "immediately after"
-			if dependency.WaitForHealthy {
-				prefix = "after waiting for"
+		for _, deployment := range deployOrder {
+			fmt.Printf("%s.%s\n", deployment.Type, deployment.Name)
+			dependencies, err := graph.Dependencies(deployment)
+			if err != nil {
+				return err
 			}
-			fmt.Printf("\t%s %s.%s\n", prefix, dependency.Type, dependency.Name)
+			for _, dependency := range dependencies {
+				prefix := "immediately after"
+				if dependency.WaitForHealthy {
+					prefix = "after waiting for"
+				}
+				fmt.Printf("\t%s %s.%s\n", prefix, dependency.Type, dependency.Name)
+			}
 		}
 	}
+	// run mock deployment
+	rand.Seed(time.Now().UnixNano())
+	mapper := func(ref model.DeploymentRef) (deploy.Deployer, error) {
+		return &mockDeployer{
+			ref:                ref,
+			minDeployTime:      50 * time.Millisecond,
+			maxDeployTime:      250 * time.Millisecond,
+			deployErrorChance:  0.01,
+			minHealthyTime:     50 * time.Millisecond,
+			maxHealthyTime:     250 * time.Millisecond,
+			healthyErrorChance: 0.02,
+		}, nil
+	}
+	deployer, err := deploy.NewGraphDeployer(&graph, mapper)
+	if err != nil {
+		return fmt.Errorf("creating graph deployer: %w", err)
+	}
+	var wg sync.WaitGroup
+	events := deployer.EventsChan()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for event := range events {
+			var otherPart string
+			if event.Err != nil {
+				otherPart = fmt.Sprintf(", error: %s", event.Err.Error())
+			} else if event.Dependency.Deployment != nil {
+				deployRef := event.Dependency.Deployment.Ref()
+				otherPart = fmt.Sprintf(", dependency: %s.%s", deployRef.Type, deployRef.Name)
+			}
+			deployRef := event.Deployment.Ref()
+			timeFormat := "2006-01-02T15:04:05.000Z07:00"
+			fmt.Printf("%s workerID=%d queueLen=%d %s: %s.%s%s\n", time.Now().Format(timeFormat),
+				event.WorkerID, len(events), event.Type, deployRef.Type, deployRef.Name, otherPart)
+		}
+	}()
+	if err := deployer.Deploy(); err != nil {
+		return fmt.Errorf("deploying graph: %w", err)
+	}
+	wg.Wait()
 	return nil
 }
 
@@ -185,5 +233,37 @@ func (v *stringSliceValue) String() string {
 
 func (v *stringSliceValue) Set(value string) error {
 	*v = append(*v, value)
+	return nil
+}
+
+type mockDeployer struct {
+	ref                model.DeploymentRef
+	minDeployTime      time.Duration
+	maxDeployTime      time.Duration
+	deployErrorChance  float32
+	minHealthyTime     time.Duration
+	maxHealthyTime     time.Duration
+	healthyErrorChance float32
+}
+
+func (d *mockDeployer) DeploymentRef() model.DeploymentRef {
+	return d.ref
+}
+
+func (d *mockDeployer) Deploy() error {
+	waitTime := d.minDeployTime + time.Duration(rand.Int63n(int64(d.maxDeployTime-d.minDeployTime)))
+	time.Sleep(waitTime)
+	if d.deployErrorChance != 0 && rand.Float32() < d.deployErrorChance {
+		return fmt.Errorf("mock error")
+	}
+	return nil
+}
+
+func (d *mockDeployer) WaitUntilHealthy() error {
+	waitTime := d.minHealthyTime + time.Duration(rand.Int63n(int64(d.maxHealthyTime-d.minHealthyTime)))
+	time.Sleep(waitTime)
+	if d.healthyErrorChance != 0 && rand.Float32() < d.healthyErrorChance {
+		return fmt.Errorf("mock error")
+	}
 	return nil
 }
