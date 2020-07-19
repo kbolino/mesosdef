@@ -3,18 +3,34 @@ package deploy
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/kbolino/mesosdef/model"
 )
 
-type Mapper func(ref model.DeploymentRef) (Deployer, error)
-
+// EventType indicates the type of an Event produced by a GraphDeployer.
 type EventType int32
 
+// EventType constants are used for a particular deployment according to the
+// following state diagram, where {} means possible repetition:
+//
+//                           EventEnqueued
+//                                 |
+//                           EventDequeued
+//                          /             \
+//        EventDependenciesResolved        EventDeploymentFailure
+//       /                         \
+//     {EventDependencySuccess}     EventDependencyFailure
+//                 |                        |
+//      EventDeploymentStarted              |
+//     /                      \             |
+//    EventDeploymentSuccess   EventDeploymentFailure
 const (
 	EventEnqueued EventType = iota
 	EventDequeued
 	EventError
+	EventDependenciesResolved
 	EventDependencyFailure
 	EventDependencySuccess
 	EventDeploymentStarted
@@ -28,8 +44,8 @@ func (e EventType) String() string {
 		return "EventEnqueued"
 	case EventDequeued:
 		return "EventDequeued"
-	case EventError:
-		return "EventError"
+	case EventDependenciesResolved:
+		return "EventDependenciesResolved"
 	case EventDependencyFailure:
 		return "EventDependencyFailure"
 	case EventDependencySuccess:
@@ -45,11 +61,14 @@ func (e EventType) String() string {
 	}
 }
 
+// Dependency encapsulates the parameters of an active deployment dependency
+// target.
 type Dependency struct {
 	Deployment     *Deployment
 	WaitForHealthy bool
 }
 
+// Event is produced by GraphDeployer as deployments change state.
 type Event struct {
 	Type       EventType
 	WorkerID   int
@@ -58,7 +77,13 @@ type Event struct {
 	Err        error
 }
 
-type Listener func(e Event)
+// Stats contains statistics on the results of a deployment.
+type Stats struct {
+	TotalDeployments      int32
+	SuccessfulDeployments int32
+	FailedDeployments     int32
+	ElapsedTime           time.Duration
+}
 
 type Option func(c *deployerConfig) error
 
@@ -99,9 +124,12 @@ type deployerConfig struct {
 	errorsChanSize int
 }
 
+// GraphDeployer uses a Deployer to execute the ordered, dependency-conscious
+// deployment of all resources described by a graph.
+// A single GraphDeployer is meant to execute a single deployment.
 type GraphDeployer struct {
 	graph             *model.Graph
-	mapper            Mapper
+	deployer          Deployer
 	maxDeploy         int
 	closeWorkChanOnce sync.Once
 	workChan          chan *Deployment
@@ -110,13 +138,16 @@ type GraphDeployer struct {
 	deploymentsByRef  map[model.DeploymentRef]*Deployment
 	eventsChan        chan Event
 	errorsChan        chan error
+	stats             Stats
 }
 
-func NewGraphDeployer(graph *model.Graph, mapper Mapper, options ...Option) (*GraphDeployer, error) {
+// NewGraphDeployer creates a new GraphDeployer for the given graph,
+// deployer, and options.
+func NewGraphDeployer(graph *model.Graph, deployer Deployer, options ...Option) (*GraphDeployer, error) {
 	if graph == nil {
 		return nil, fmt.Errorf("graph is nil")
-	} else if mapper == nil {
-		return nil, fmt.Errorf("mapper is nil")
+	} else if deployer == nil {
+		return nil, fmt.Errorf("deployer is nil")
 	}
 	c := &deployerConfig{
 		maxDeploy:      2,
@@ -132,7 +163,7 @@ func NewGraphDeployer(graph *model.Graph, mapper Mapper, options ...Option) (*Gr
 	}
 	return &GraphDeployer{
 		graph:      graph,
-		mapper:     mapper,
+		deployer:   deployer,
 		maxDeploy:  c.maxDeploy,
 		workChan:   make(chan *Deployment, c.workChanSize),
 		eventsChan: make(chan Event, c.eventsChanSize),
@@ -140,13 +171,28 @@ func NewGraphDeployer(graph *model.Graph, mapper Mapper, options ...Option) (*Gr
 	}, nil
 }
 
-func (d *GraphDeployer) EventsChan() <-chan Event {
+// Events returns the channel of events that will be produced by Deploy.
+func (d *GraphDeployer) Events() <-chan Event {
 	return d.eventsChan
 }
 
+// Stats returns statistics on the deployment, which are only meaningful
+// after Deploy has been called.
+func (d *GraphDeployer) Stats() Stats {
+	return d.stats
+}
+
+// Deploy executes the deployment process, blocking until it is complete.
+// To monitor the status of the deployment, use the Events channel.
+// Deploy will create a fixed number of worker goroutines to execute the
+// and will wait until they all complete.
 func (d *GraphDeployer) Deploy() error {
 	defer close(d.eventsChan)
 	defer d.closeWorkChan()
+	startTime := time.Now()
+	defer func() {
+		d.stats.ElapsedTime = time.Now().Sub(startTime)
+	}()
 	for i := 0; i < d.maxDeploy; i++ {
 		d.waitGroup.Add(1)
 		go func(workerID int) {
@@ -156,32 +202,29 @@ func (d *GraphDeployer) Deploy() error {
 	}
 	deployOrder, err := d.graph.DeployOrder()
 	if err != nil {
-		return err
+		return fmt.Errorf("resolving deployment order: %w", err)
 	}
+	d.stats.TotalDeployments = int32(len(deployOrder))
 	d.deployments = make([]Deployment, len(deployOrder))
 	d.deploymentsByRef = make(map[model.DeploymentRef]*Deployment, len(deployOrder))
 	for i, deployRef := range deployOrder {
 		deployment := &d.deployments[i]
-		deployer, err := d.mapper(deployRef)
-		if err != nil {
-			return fmt.Errorf("mapping deployment %s.%s to deployer: %w", deployRef.Type, deployRef.Name, err)
-		}
-		if err := deployment.ready(deployer); err != nil {
-			return fmt.Errorf("readying deployment %s.%s: %w", deployRef.Type, deployRef.Name, err)
+		if err := deployment.ready(d.deployer, deployRef); err != nil {
+			return fmt.Errorf("readying deployment: %w", err)
 		}
 		d.deploymentsByRef[deployRef] = deployment
 	}
 	for i := range d.deployments {
 		deployment := &d.deployments[i]
-		d.workChan <- deployment
 		d.sendEvent(0, Event{
 			Type:       EventEnqueued,
 			Deployment: deployment,
 		})
+		d.workChan <- deployment
 	}
 	d.closeWorkChan()
 	d.waitGroup.Wait()
-	// TODO handle multiple errors
+	// TODO handle multiple errors?
 	select {
 	case err := <-d.errorsChan:
 		return err
@@ -190,12 +233,14 @@ func (d *GraphDeployer) Deploy() error {
 	}
 }
 
+// closeWorkChan closes the worker channel safely.
 func (d *GraphDeployer) closeWorkChan() {
 	d.closeWorkChanOnce.Do(func() {
 		close(d.workChan)
 	})
 }
 
+// sendError sends an error to the errors channel without blocking.
 func (d *GraphDeployer) sendError(err error) {
 	select {
 	case d.errorsChan <- err:
@@ -203,6 +248,8 @@ func (d *GraphDeployer) sendError(err error) {
 	}
 }
 
+// sendEvent sends an event to the events channel without blocking.
+// workerID is a mandatory parameter to ensure it gets set.
 func (d *GraphDeployer) sendEvent(workerID int, event Event) {
 	event.WorkerID = workerID
 	select {
@@ -211,106 +258,99 @@ func (d *GraphDeployer) sendEvent(workerID int, event Event) {
 	}
 }
 
+// workerMain is the entry point for the worker goroutines, each of which
+// should have a distinct workerID.
 func (d *GraphDeployer) workerMain(workerID int) {
-workLoop:
 	for deployment := range d.workChan {
 		deployRef := deployment.Ref()
-		// resolve dependencies
-		dependRefs, err := d.graph.Dependencies(deployRef)
-		if err != nil {
-			err = fmt.Errorf("cannot resolve dependencies: %w", err)
-			deployment.cancel(err)
-			d.sendEvent(workerID, Event{
-				Type:       EventError,
-				Deployment: deployment,
-				Err:        err,
-			})
-			d.sendError(err)
-			continue workLoop
-		}
-		// map dependencies to their deployments
-		var dependencies []Dependency
-		if len(dependRefs) != 0 {
-			dependencies = make([]Dependency, len(dependRefs))
-			for i, dependRef := range dependRefs {
-				dependency, ok := d.deploymentsByRef[dependRef.DeploymentRef()]
-				if !ok {
-					err = fmt.Errorf("no deployment exists for dependency %s.%s", dependRef.Type, dependRef.Name)
-					deployment.cancel(err)
-					d.sendEvent(workerID, Event{
-						Type:       EventError,
-						Deployment: deployment,
-						Err:        err,
-					})
-					d.sendError(err)
-					continue workLoop
-				}
-				dependencies[i] = Dependency{
-					Deployment:     dependency,
-					WaitForHealthy: dependRef.WaitForHealthy,
-				}
-			}
-		}
 		d.sendEvent(workerID, Event{
 			Type:       EventDequeued,
 			Deployment: deployment,
 		})
-		// wait for dependencies
-		for i, dependency := range dependencies {
-			dependRef := dependRefs[i]
-			err := dependency.Deployment.WaitUntilDeployed()
+		if err := d.workerDeploy(workerID, deployment); err != nil {
+			// ignore cancelation errors, if it's too late to cancel then the
+			// error came from the deployment anyway
+			_ = deployment.cancel(err)
+			atomic.AddInt32(&d.stats.FailedDeployments, 1)
+			d.sendError(fmt.Errorf("deploying %s.%s: %w", deployRef.Type, deployRef.Name, err))
+			d.sendEvent(workerID, Event{
+				Type:       EventDeploymentFailure,
+				Deployment: deployment,
+				Err:        err,
+			})
+		} else {
+			atomic.AddInt32(&d.stats.SuccessfulDeployments, 1)
+			d.sendEvent(workerID, Event{
+				Type:       EventDeploymentSuccess,
+				Deployment: deployment,
+				Err:        err,
+			})
+		}
+	}
+}
+
+func (d *GraphDeployer) workerDeploy(workerID int, deployment *Deployment) error {
+	deployRef := deployment.Ref()
+	// resolve dependencies
+	dependRefs, err := d.graph.Dependencies(deployRef)
+	if err != nil {
+		return fmt.Errorf("cannot resolve dependencies: %w", err)
+	}
+	// map dependencies to their deployments
+	var dependencies []Dependency
+	if len(dependRefs) != 0 {
+		dependencies = make([]Dependency, len(dependRefs))
+		for i, dependRef := range dependRefs {
+			dependency, ok := d.deploymentsByRef[dependRef.DeploymentRef()]
+			if !ok {
+				return fmt.Errorf("no deployment exists for dependency %s.%s", dependRef.Type, dependRef.Name)
+			}
+			dependencies[i] = Dependency{
+				Deployment:     dependency,
+				WaitForHealthy: dependRef.WaitForHealthy,
+			}
+		}
+	}
+	d.sendEvent(workerID, Event{
+		Type:       EventDependenciesResolved,
+		Deployment: deployment,
+	})
+	// wait for dependencies
+	for i, dependency := range dependencies {
+		dependRef := dependRefs[i]
+		err := dependency.Deployment.WaitUntilDeployed()
+		if err != nil {
+			d.sendEvent(workerID, Event{
+				Type:       EventDependencyFailure,
+				Deployment: deployment,
+				Dependency: dependency,
+				Err:        err,
+			})
+			return fmt.Errorf("dependency %s.%s failed to deploy: %w", dependRef.Type, dependRef.Name, err)
+		}
+		if dependRef.WaitForHealthy {
+			err := dependency.Deployment.WaitUntilHealthy()
 			if err != nil {
-				err = fmt.Errorf("dependency %s.%s failed to deploy: %w", dependRef.Type, dependRef.Name, err)
-				deployment.cancel(err)
 				d.sendEvent(workerID, Event{
 					Type:       EventDependencyFailure,
 					Deployment: deployment,
 					Dependency: dependency,
 					Err:        err,
 				})
-				d.sendError(err)
-				continue workLoop
+				return fmt.Errorf("dependency %s.%s failed to become healthy: %w",
+					dependRef.Type, dependRef.Name, err)
 			}
-			if dependRef.WaitForHealthy {
-				err := dependency.Deployment.WaitUntilHealthy()
-				if err != nil {
-					err = fmt.Errorf("dependency %s.%s failed to become healthy: %w",
-						dependRef.Type, dependRef.Name, err)
-					deployment.cancel(err)
-					d.sendEvent(workerID, Event{
-						Type:       EventDependencyFailure,
-						Deployment: deployment,
-						Dependency: dependency,
-						Err:        err,
-					})
-					d.sendError(err)
-					continue workLoop
-				}
-			}
-			d.sendEvent(workerID, Event{
-				Type:       EventDependencySuccess,
-				Deployment: deployment,
-				Dependency: dependency,
-			})
 		}
-		// start the deployment
 		d.sendEvent(workerID, Event{
-			Type:       EventDeploymentStarted,
+			Type:       EventDependencySuccess,
 			Deployment: deployment,
+			Dependency: dependency,
 		})
-		if err := deployment.deploy(); err != nil {
-			err = fmt.Errorf("deploying %s.%s: %w", deployRef.Type, deployRef.Name, err)
-			d.sendEvent(workerID, Event{
-				Type:       EventDeploymentFailure,
-				Deployment: deployment,
-				Err:        err,
-			})
-			d.sendError(err)
-		} else {
-			d.sendEvent(workerID, Event{
-				Type:       EventDeploymentSuccess,
-				Deployment: deployment,
-			})
-		}
 	}
+	// start the deployment
+	d.sendEvent(workerID, Event{
+		Type:       EventDeploymentStarted,
+		Deployment: deployment,
+	})
+	return deployment.deploy()
 }

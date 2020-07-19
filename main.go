@@ -39,7 +39,7 @@ func main() {
 	flag.Parse()
 	// run
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "FATAL: %s", err)
+		fmt.Fprintf(os.Stderr, "FATAL: %s\n", err)
 		os.Exit(1)
 	}
 }
@@ -182,44 +182,45 @@ func run() error {
 	}
 	// run mock deployment
 	rand.Seed(time.Now().UnixNano())
-	mapper := func(ref model.DeploymentRef) (deploy.Deployer, error) {
-		return &mockDeployer{
-			ref:                ref,
-			minDeployTime:      50 * time.Millisecond,
-			maxDeployTime:      250 * time.Millisecond,
-			deployErrorChance:  0.01,
-			minHealthyTime:     50 * time.Millisecond,
-			maxHealthyTime:     250 * time.Millisecond,
-			healthyErrorChance: 0.02,
-		}, nil
+	deployer := &mockDeployer{
+		minDeployTime:      50 * time.Millisecond,
+		maxDeployTime:      250 * time.Millisecond,
+		deployErrorChance:  0.01,
+		minHealthyTime:     200 * time.Millisecond,
+		maxHealthyTime:     700 * time.Millisecond,
+		healthyErrorChance: 0.01,
 	}
-	deployer, err := deploy.NewGraphDeployer(&graph, mapper)
+	graphDeployer, err := deploy.NewGraphDeployer(&graph, deployer)
 	if err != nil {
 		return fmt.Errorf("creating graph deployer: %w", err)
 	}
 	var wg sync.WaitGroup
-	events := deployer.EventsChan()
+	events := graphDeployer.Events()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for event := range events {
 			var otherPart string
 			if event.Err != nil {
-				otherPart = fmt.Sprintf(", error: %s", event.Err.Error())
+				otherPart = fmt.Sprintf(", error='%s'", event.Err.Error())
 			} else if event.Dependency.Deployment != nil {
 				deployRef := event.Dependency.Deployment.Ref()
-				otherPart = fmt.Sprintf(", dependency: %s.%s", deployRef.Type, deployRef.Name)
+				otherPart = fmt.Sprintf(", dependency=%s.%s", deployRef.Type, deployRef.Name)
 			}
 			deployRef := event.Deployment.Ref()
 			timeFormat := "2006-01-02T15:04:05.000Z07:00"
-			fmt.Printf("%s workerID=%d queueLen=%d %s: %s.%s%s\n", time.Now().Format(timeFormat),
+			fmt.Printf("%s workerID=%d queueLen=%-3d %-25s %s.%s%s\n", time.Now().Format(timeFormat),
 				event.WorkerID, len(events), event.Type, deployRef.Type, deployRef.Name, otherPart)
 		}
 	}()
-	if err := deployer.Deploy(); err != nil {
-		return fmt.Errorf("deploying graph: %w", err)
-	}
+	deployErr := graphDeployer.Deploy()
 	wg.Wait()
+	stats := graphDeployer.Stats()
+	fmt.Printf("Result: %d successful and %d failed deployments of %d resources in %s\n", stats.SuccessfulDeployments,
+		stats.FailedDeployments, stats.TotalDeployments, stats.ElapsedTime.Truncate(time.Millisecond))
+	if deployErr != nil {
+		return fmt.Errorf("deploying graph: %w", deployErr)
+	}
 	return nil
 }
 
@@ -237,7 +238,6 @@ func (v *stringSliceValue) Set(value string) error {
 }
 
 type mockDeployer struct {
-	ref                model.DeploymentRef
 	minDeployTime      time.Duration
 	maxDeployTime      time.Duration
 	deployErrorChance  float32
@@ -246,11 +246,9 @@ type mockDeployer struct {
 	healthyErrorChance float32
 }
 
-func (d *mockDeployer) DeploymentRef() model.DeploymentRef {
-	return d.ref
-}
+var _ deploy.Deployer = &mockDeployer{}
 
-func (d *mockDeployer) Deploy() error {
+func (d *mockDeployer) Deploy(ref model.DeploymentRef) error {
 	waitTime := d.minDeployTime + time.Duration(rand.Int63n(int64(d.maxDeployTime-d.minDeployTime)))
 	time.Sleep(waitTime)
 	if d.deployErrorChance != 0 && rand.Float32() < d.deployErrorChance {
@@ -259,7 +257,7 @@ func (d *mockDeployer) Deploy() error {
 	return nil
 }
 
-func (d *mockDeployer) WaitUntilHealthy() error {
+func (d *mockDeployer) WaitUntilHealthy(ref model.DeploymentRef) error {
 	waitTime := d.minHealthyTime + time.Duration(rand.Int63n(int64(d.maxHealthyTime-d.minHealthyTime)))
 	time.Sleep(waitTime)
 	if d.healthyErrorChance != 0 && rand.Float32() < d.healthyErrorChance {
