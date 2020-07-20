@@ -15,8 +15,19 @@ infrastructure-as-code and applying it to the Mesos ecosystem.
 
 ### Currently
 
-`mesosdef -file example.hcl` will compute the dependency graph for the defined
-deployments and print them in the order they would be deployed
+`mesosdef -dryRun -file example.hcl` will compute the dependency graph for the
+defined deployments and print them in the order they would be deployed
+
+`mesosdef -file example.hcl` will simulate a deployment, with a chance of
+failure for each resource, and print the results as they occur
+
+To use the `example.hcl` in this repository, it is currently also necessary to
+set the variables `deploy_root` and `dns_tld` which can be done with `-var`
+arguments or environment variables; a working command line might be
+
+```
+mesosdef -file example.hcl -var dns_tld=mesos -var deploy_root=./deploy
+```
 
 ### Future
 
