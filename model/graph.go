@@ -238,11 +238,11 @@ func globToRegexp(glob string) (string, error) {
 	result.WriteRune('^')
 	backslash := false
 	for i, r := range glob {
+		clearBackslash := backslash
 		switch r {
 		case '\\':
 			if backslash {
 				result.WriteString("\\\\")
-				backslash = false
 			} else {
 				backslash = true
 			}
@@ -277,6 +277,9 @@ func globToRegexp(glob string) (string, error) {
 			} else {
 				result.WriteString(regexp.QuoteMeta(glob[i : i+utf8.RuneLen(r)]))
 			}
+		}
+		if clearBackslash {
+			backslash = false
 		}
 	}
 	result.WriteRune('$')
