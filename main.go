@@ -179,6 +179,7 @@ func run() error {
 				fmt.Printf("\t%s %s.%s\n", prefix, dependency.Type, dependency.Name)
 			}
 		}
+		return nil
 	}
 	// run mock deployment
 	rand.Seed(time.Now().UnixNano())
